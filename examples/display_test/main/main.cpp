@@ -9,7 +9,9 @@
 #include <WiFiUdp.h>  // before lwip RE: https://github.com/espressif/arduino-esp32/issues/4405
 #include <lwip/sockets.h>
 // others
+#include <Wire.h>
 #include <epdiy.h>
+#include <board/pca9555.h>
 #include <esp_heap_caps.h>
 #include <esp_log.h>
 #include <esp_sleep.h>
@@ -61,7 +63,20 @@ extern "C" void app_main() {
 }
 #endif
 
-#define DEEP_SLEEP_DURATION_SECONDS 21600
+// --- Test-mode toggle ---
+// 1 = verify the wake/download/display cycle quickly: wakes every minute,
+// always clears the screen, and shows a wake counter (trades away all the
+// power-saving behavior below on purpose, for visibility during testing).
+// 0 = normal deployment: 3-hour wakes, screen only clears on cold boot.
+// Set back to 0 (and re-check CORE_DEBUG_LEVEL in platformio.ini) before
+// leaving this on the device for real.
+#define TEST_MODE 0
+
+#if TEST_MODE
+#define DEEP_SLEEP_DURATION_SECONDS 60
+#else
+#define DEEP_SLEEP_DURATION_SECONDS 10800
+#endif
 
 #define WAVEFORM EPD_BUILTIN_WAVEFORM
 
@@ -76,13 +91,25 @@ EpdiyHighlevelState hl;
 
 // --- Configuration ---
 // Replace with your network credentials
-#define WIFI_SSID "SSID"
-#define WIFI_PASS "PASS"
+#define WIFI_SSID "HELIUM"
+#define WIFI_PASS "boogiedownbogenhausen"
 #define MAX_RETRIES 10  // Maximum connection retries
 
 // --- Globals ---
 static const char* TAG = "HTTP_CLIENT_EXAMPLE";
 static int s_retry_num = 0;
+
+// RTC-retained Wi-Fi AP cache: survives deep sleep in RTC slow memory, so the
+// next wake can connect directly to the last-known BSSID/channel instead of
+// doing a full channel scan (cuts connect time from ~3-4s to well under 1s).
+#define FAST_RECONNECT_MAX_ATTEMPTS 2  // give up on the cached AP after this many failures
+RTC_DATA_ATTR static uint8_t s_saved_bssid[6] = {0};
+RTC_DATA_ATTR static uint8_t s_saved_channel = 0;
+RTC_DATA_ATTR static bool s_have_saved_ap_info = false;
+
+// Test-mode only: counts wakes across deep-sleep cycles so it's visible on
+// the physical display whether/how often the device is actually waking up.
+RTC_DATA_ATTR static uint32_t s_wake_count = 0;
 
 // --- FIXED ---
 // Make both buffer and its length counter file-static so they can be reset
@@ -211,7 +238,9 @@ static void http_get_request_task(void* pvParameters) {
   ESP_LOGI(TAG, "Starting HTTP GET request task...");
 
   esp_http_client_config_t config = {
-      .url = "add here",
+      .url =
+          "http://door-sam-web-dot-sam-service-464622.ew.r.appspot.com/gcs/"
+          "door_sam/sam/door.txt",
       .event_handler = _http_event_handler,
   };
   esp_http_client_handle_t client = esp_http_client_init(&config);
@@ -244,6 +273,27 @@ static void http_get_request_task(void* pvParameters) {
  * @param event_id The ID of the event.
  * @param event_data Data associated with the event.
  */
+// Applies the STA config, optionally pinning it to the cached BSSID/channel
+// so the join skips a full channel scan. Shared by the initial connect and
+// the mid-retry fallback below.
+static void configure_wifi_sta(bool use_cached_ap) {
+  wifi_config_t wifi_config;
+  memset(&wifi_config, 0, sizeof(wifi_config));
+  strcpy((char*)wifi_config.sta.ssid, WIFI_SSID);
+  strcpy((char*)wifi_config.sta.password, WIFI_PASS);
+  wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+
+  if (use_cached_ap && s_have_saved_ap_info) {
+    wifi_config.sta.channel = s_saved_channel;
+    wifi_config.sta.bssid_set = true;
+    memcpy(wifi_config.sta.bssid, s_saved_bssid, sizeof(s_saved_bssid));
+    ESP_LOGI(TAG, "Using cached AP (channel %d) for fast reconnect",
+             s_saved_channel);
+  }
+
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+}
+
 static void event_handler(void* arg, esp_event_base_t event_base,
                           int32_t event_id, void* event_data) {
   if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
@@ -253,6 +303,14 @@ static void event_handler(void* arg, esp_event_base_t event_base,
   } else if (event_base == WIFI_EVENT &&
              event_id == WIFI_EVENT_STA_DISCONNECTED) {
     if (s_retry_num < MAX_RETRIES) {
+      // If we tried the cached BSSID/channel and it didn't pan out (AP moved,
+      // is off, etc.), fall back to a normal full scan for the remaining
+      // retries instead of repeatedly failing against a stale cache entry.
+      if (s_have_saved_ap_info && s_retry_num == FAST_RECONNECT_MAX_ATTEMPTS) {
+        ESP_LOGW(TAG, "Cached AP didn't connect; falling back to full scan.");
+        s_have_saved_ap_info = false;
+        configure_wifi_sta(false);
+      }
       esp_wifi_connect();
       s_retry_num++;
       ESP_LOGI(TAG, "Retry connecting to the AP (%d/%d)", s_retry_num,
@@ -267,6 +325,15 @@ static void event_handler(void* arg, esp_event_base_t event_base,
     ip_event_got_ip_t* event = (ip_event_got_ip_t*)event_data;
     ESP_LOGI(TAG, "Got IP address: " IPSTR, IP2STR(&event->ip_info.ip));
     s_retry_num = 0;
+
+    // Cache the AP we just joined so the next wake can skip the scan phase.
+    wifi_ap_record_t ap_info;
+    if (esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK) {
+      memcpy(s_saved_bssid, ap_info.bssid, sizeof(s_saved_bssid));
+      s_saved_channel = ap_info.primary;
+      s_have_saved_ap_info = true;
+    }
+
     xEventGroupSetBits(s_wifi_event_group, WIFI_CONNECTED_BIT);
     app_state = STATE_CONNECTED;
     // NOTE: The HTTP request task is no longer started here.
@@ -303,14 +370,8 @@ void wifi_init_sta(void) {
       IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &instance_got_ip));
 
   // Configure Wi-Fi using a more robust initialization method
-  wifi_config_t wifi_config;
-  memset(&wifi_config, 0, sizeof(wifi_config));
-  strcpy((char*)wifi_config.sta.ssid, WIFI_SSID);
-  strcpy((char*)wifi_config.sta.password, WIFI_PASS);
-  wifi_config.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
-
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+  configure_wifi_sta(/*use_cached_ap=*/true);
   ESP_ERROR_CHECK(esp_wifi_start());
 
   ESP_LOGI(TAG, "wifi_init_sta finished.");
@@ -331,6 +392,13 @@ void wifi_init_sta(void) {
 }
 
 void idf_setup() {
+  // This build doesn't have the ESP-IDF power-management component
+  // (CONFIG_PM_ENABLE), so no automatic light-sleep-on-idle is available --
+  // but nothing in this cycle (e-paper refresh, Wi-Fi/HTTP, text layout) is
+  // CPU-bound, so just run the whole cycle at a lower, still Wi-Fi-safe
+  // clock instead of the default 240MHz.
+  setCpuFrequencyMhz(80);
+
   Wire.begin(39, 40);
 
   epd_init(&DEMO_BOARD, &ED047TC1, EPD_LUT_64K);
@@ -346,18 +414,36 @@ void idf_setup() {
   printf("Dimensions after rotation, width: %d height: %d\n\n",
          epd_rotated_display_width(), epd_rotated_display_height());
 
-  // Initial screen update to show we're initializing
-  uint8_t* fb = epd_hl_get_framebuffer(&hl);
-  epd_poweron();
-  epd_clear();
-  EpdFontProperties font_props = epd_font_properties_default();
-  font_props.flags = EPD_DRAW_ALIGN_CENTER;
-  int cursor_x = epd_rotated_display_width() / 2;
-  int cursor_y = epd_rotated_display_height() / 2;
-  epd_write_string(&FiraSans_20, "Initializing...", &cursor_x, &cursor_y, fb,
-                   &font_props);
-  epd_hl_update_screen(&hl, DISPLAY_MODE, epd_ambient_temperature());
-  epd_poweroff();
+  s_wake_count++;
+  ESP_LOGI(TAG, "Wake #%lu, wakeup cause: %d", (unsigned long)s_wake_count,
+           (int)esp_sleep_get_wakeup_cause());
+
+  // A deep-sleep wake is a full chip reboot, so idf_setup() reruns every
+  // cycle. Normally we only draw this screen on a genuine cold boot -- on a
+  // routine timer wake it's a full, expensive e-paper refresh that just gets
+  // thrown away a few seconds later when the real content draws. In
+  // TEST_MODE we always draw it (with a wake counter instead of the
+  // "Initializing..." text) so the wake cadence is visible on the panel.
+  if (TEST_MODE || esp_sleep_get_wakeup_cause() != ESP_SLEEP_WAKEUP_TIMER) {
+    uint8_t* fb = epd_hl_get_framebuffer(&hl);
+    epd_poweron();
+    epd_clear();
+    EpdFontProperties font_props = epd_font_properties_default();
+    font_props.flags = EPD_DRAW_ALIGN_CENTER;
+    int cursor_x = epd_rotated_display_width() / 2;
+    int cursor_y = epd_rotated_display_height() / 2;
+    char status_text[32];
+#if TEST_MODE
+    snprintf(status_text, sizeof(status_text), "Wake #%lu",
+             (unsigned long)s_wake_count);
+#else
+    strcpy(status_text, "Initializing...");
+#endif
+    epd_write_string(&FiraSans_20, status_text, &cursor_x, &cursor_y,
+                     fb, &font_props);
+    epd_hl_update_screen(&hl, DISPLAY_MODE, epd_ambient_temperature());
+    epd_poweroff();
+  }
 
   // Initialize NVS
   esp_err_t ret = nvs_flash_init();
@@ -491,6 +577,8 @@ void PrintMessage(const char* text_to_display) {
  * This function now handles the entire download-display-delay cycle.
  */
 void idf_loop() {
+  ESP_LOGI(TAG, "Cycle starting..");
+
   // --- FIXED ---
   // Free buffer AND reset the length counter from the previous loop.
   // This ensures a clean state for every download cycle.
@@ -503,22 +591,6 @@ void idf_loop() {
   // --- Start Download ---
   ESP_LOGI(TAG, "Starting new download cycle.");
   app_state = STATE_DOWNLOADING;
-
-  // Update screen to show download status
-  epd_poweron();
-  epd_clear();
-  // We write directly to the framebuffer here for a status message
-  uint8_t* fb = epd_hl_get_framebuffer(&hl);
-  memset(fb, 0xFF,
-         epd_rotated_display_width() * epd_rotated_display_height() / 2);
-  EpdFontProperties font_props = epd_font_properties_default();
-  font_props.flags = EPD_DRAW_ALIGN_CENTER;
-  int cursor_x = epd_rotated_display_width() / 2;
-  int cursor_y = epd_rotated_display_height() / 2;
-  epd_write_string(&FiraSans_20, "Downloading...", &cursor_x, &cursor_y, fb,
-                   &font_props);
-  epd_hl_update_screen(&hl, DISPLAY_MODE, epd_ambient_temperature());
-  epd_poweroff();
 
   // Spawn the task that performs the HTTP GET request
   xTaskCreate(&http_get_request_task, "http_get_request_task", 8192, NULL, 5,
@@ -545,5 +617,31 @@ void idf_loop() {
            DEEP_SLEEP_DURATION_SECONDS);
   // Enter deep sleep to save power. The device will reset and start from
   // app_main() after the timer expires.
+
+  // epdiy's own epd_board_init() (epd_board_v7.c) unconditionally sets the
+  // shared I/O-expander's Port 0 (8 pins, address 0x20) to outputs driven
+  // HIGH on every boot, and never reverts that -- if any of those pins gate
+  // power to something on this board revision (e.g. backlight/touch), it
+  // would otherwise stay powered for the entire sleep. Best-effort: drive
+  // Port 0 low before sleeping, on the common (but unconfirmed for this
+  // exact board) assumption that such gates are active-high enables. This
+  // is safe to get wrong either way: epd_board_init() unconditionally
+  // drives Port 0 back to 0xFF at the very start of the next boot, so this
+  // can only affect the sleep window itself, never the running state.
+  // Must run before epd_deinit() below, which deletes this I2C driver.
+  esp_err_t port0_err = pca9555_set_value(I2C_NUM_0, 0x00, /*high_port=*/0);
+  if (port0_err != ESP_OK) {
+    ESP_LOGW(TAG, "Could not drive I/O-expander Port 0 low before sleep: %s",
+             esp_err_to_name(port0_err));
+  }
+
+  // epdiy's own docs (epd_board_specific.h) call for this before sleeping:
+  // it tears down the LCD peripheral, waits for the TPS65185 HV supply to
+  // confirm it has actually powered down, and releases the I2C driver/ISR
+  // instead of leaving them installed and idle through the whole sleep.
+  epd_deinit();
+
+  esp_wifi_stop();
+
   esp_deep_sleep(DEEP_SLEEP_DURATION_SECONDS * 1000000ULL);
 }
